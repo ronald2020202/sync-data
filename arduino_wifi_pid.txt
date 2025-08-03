@@ -1,0 +1,464 @@
+#include <PID_v1.h>
+#include <WiFiS3.h>
+
+// WiFi credentials - CHANGE THESE TO YOUR NETWORK
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Server settings
+WiFiServer server(80);  // HTTP server on port 80
+WiFiClient client;
+bool clientConnected = false;
+
+// Motor pins
+const int MOTOR_PWM_PIN = 10;
+const int MOTOR_DIR_PIN1 = 11;
+const int MOTOR_DIR_PIN2 = 9;
+
+// Encoder pins
+const int ENCODER_A_PIN = 3;
+const int ENCODER_B_PIN = 4;
+
+// Encoder variables
+volatile long encoderTicks = 0;
+volatile bool lastEncoderA = false;
+
+// PID variables
+double pidSetpoint = 0.0;
+double pidInput = 0.0;
+double pidOutput = 0.0;
+
+// PID tuning parameters
+double Kp = 0.5;
+double Ki = 0.0;
+double Kd = 0.12;
+
+// Create PID controller
+PID motorPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
+
+// Global variables
+bool PID_ENABLED = false;
+long goalTick = 0;
+static int stableCount = 0;
+
+// Status reporting
+unsigned long lastStatusTime = 0;
+const unsigned long STATUS_INTERVAL = 100; // Send status every 100ms
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // Give serial time to initialize
+  
+  Serial.println("=== Arduino R4 WiFi PID Motor Control ===");
+  
+  // Setup pins
+  pinMode(MOTOR_PWM_PIN, OUTPUT);
+  pinMode(MOTOR_DIR_PIN1, OUTPUT);
+  pinMode(MOTOR_DIR_PIN2, OUTPUT);
+  pinMode(ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_B_PIN, INPUT_PULLUP);
+  
+  // Setup encoder interrupt
+  lastEncoderA = digitalRead(ENCODER_A_PIN);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), encoderISR, CHANGE);
+  
+  // Setup PID
+  motorPID.SetMode(AUTOMATIC);
+  motorPID.SetOutputLimits(-255, 255);
+  motorPID.SetSampleTime(10);
+  
+  // Start with motor stopped
+  stopMotor();
+  
+  // Initialize WiFi
+  setupWiFi();
+  
+  Serial.println("System ready!");
+  printStatus();
+}
+
+void loop() {
+  // Handle WiFi client connections
+  handleWiFiClient();
+  
+  // Run PID control if enabled
+  if (PID_ENABLED) {
+    runPIDControl();
+  }
+  
+  // Send periodic status updates to connected client
+  sendStatusUpdate();
+  
+  delay(10);
+}
+
+void setupWiFi() {
+  Serial.print("Connecting to WiFi network: ");
+  Serial.println(ssid);
+  
+  // Start WiFi connection
+  WiFi.begin(ssid, password);
+  
+  // Wait for connection with timeout
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected successfully!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("MAC address: ");
+    Serial.println(WiFi.macAddress());
+    
+    // Start the server
+    server.begin();
+    Serial.println("TCP server started on port 80");
+    Serial.println("Waiting for client connections...");
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi!");
+    Serial.println("Please check your credentials and try again.");
+  }
+}
+
+void handleWiFiClient() {
+  // Check for new client connections
+  if (!clientConnected) {
+    client = server.available();
+    if (client) {
+      clientConnected = true;
+      Serial.println("Client connected!");
+      sendMessage("CONNECTED Arduino R4 WiFi PID Controller Ready");
+      sendMessage("STATUS " + getStatusString());
+    }
+  }
+  
+  // Handle existing client
+  if (clientConnected && client.connected()) {
+    if (client.available()) {
+      String command = client.readStringUntil('\n');
+      command.trim();
+      processWiFiCommand(command);
+    }
+  } else if (clientConnected) {
+    // Client disconnected
+    clientConnected = false;
+    Serial.println("Client disconnected");
+  }
+}
+
+void processWiFiCommand(String command) {
+  Serial.print("Received: ");
+  Serial.println(command);
+  
+  command.toUpperCase();
+  
+  if (command == "FORWARD") {
+    PID_ENABLED = false;
+    motorForward(100);
+    sendMessage("OK Motor forward at speed 100");
+    
+  } else if (command == "REVERSE") {
+    PID_ENABLED = false;
+    motorReverse(100);
+    sendMessage("OK Motor reverse at speed 100");
+    
+  } else if (command == "STOP") {
+    PID_ENABLED = false;
+    stopMotor();
+    sendMessage("OK Motor stopped");
+    
+  } else if (command == "STATUS") {
+    sendMessage("STATUS " + getStatusString());
+    
+  } else if (command == "ZERO") {
+    zeroEncoder();
+    sendMessage("OK Encoder zeroed");
+    
+  } else if (command == "PID_ON") {
+    PID_ENABLED = true;
+    sendMessage("OK PID enabled");
+    
+  } else if (command == "PID_OFF") {
+    PID_ENABLED = false;
+    stopMotor();
+    sendMessage("OK PID disabled");
+    
+  } else if (command.startsWith("TARGET ")) {
+    long target = command.substring(7).toInt();
+    setTarget(target);
+    sendMessage("OK Target set to " + String(target));
+    
+  } else if (command.startsWith("PID ")) {
+    // Format: PID kp ki kd
+    if (parsePIDCommand(command)) {
+      sendMessage("OK PID parameters updated: Kp=" + String(Kp, 3) + 
+                 " Ki=" + String(Ki, 3) + " Kd=" + String(Kd, 3));
+    } else {
+      sendMessage("ERROR Invalid PID format. Use: PID kp ki kd");
+    }
+    
+  } else if (command.startsWith("SPEED ")) {
+    int speed = command.substring(6).toInt();
+    speed = constrain(speed, 0, 255);
+    PID_ENABLED = false;
+    motorForward(speed);
+    sendMessage("OK Motor speed set to " + String(speed));
+    
+  } else if (command == "HELP") {
+    sendHelp();
+    
+  } else {
+    sendMessage("ERROR Unknown command: " + command);
+  }
+}
+
+bool parsePIDCommand(String command) {
+  // Remove "PID " prefix
+  command = command.substring(4);
+  command.trim();
+  
+  // Parse three values
+  int firstSpace = command.indexOf(' ');
+  int secondSpace = command.indexOf(' ', firstSpace + 1);
+  
+  if (firstSpace == -1 || secondSpace == -1) {
+    return false;
+  }
+  
+  double newKp = command.substring(0, firstSpace).toDouble();
+  double newKi = command.substring(firstSpace + 1, secondSpace).toDouble();
+  double newKd = command.substring(secondSpace + 1).toDouble();
+  
+  // Validate values (basic sanity check)
+  if (newKp < 0 || newKi < 0 || newKd < 0) {
+    return false;
+  }
+  
+  // Update PID parameters
+  Kp = newKp;
+  Ki = newKi;
+  Kd = newKd;
+  motorPID.SetTunings(Kp, Ki, Kd);
+  
+  return true;
+}
+
+void sendMessage(String message) {
+  if (clientConnected && client.connected()) {
+    client.println(message);
+  }
+  Serial.println("Sent: " + message);
+}
+
+void sendHelp() {
+  sendMessage("HELP Available commands:");
+  sendMessage("HELP FORWARD - Motor forward");
+  sendMessage("HELP REVERSE - Motor reverse");
+  sendMessage("HELP STOP - Stop motor");
+  sendMessage("HELP SPEED <0-255> - Set motor speed");
+  sendMessage("HELP TARGET <ticks> - Set PID target position");
+  sendMessage("HELP PID <kp> <ki> <kd> - Set PID parameters");
+  sendMessage("HELP PID_ON - Enable PID control");
+  sendMessage("HELP PID_OFF - Disable PID control");
+  sendMessage("HELP STATUS - Get current status");
+  sendMessage("HELP ZERO - Zero encoder");
+  sendMessage("HELP HELP - Show this help");
+}
+
+String getStatusString() {
+  noInterrupts();
+  long currentTicks = encoderTicks;
+  interrupts();
+  
+  double degrees = currentTicks * 360.0 / 1000.0;
+  long error = goalTick - currentTicks;
+  
+  String status = "";
+  status += "ticks:" + String(currentTicks);
+  status += ",degrees:" + String(degrees, 1);
+  status += ",target:" + String(goalTick);
+  status += ",error:" + String(error);
+  status += ",pid_enabled:" + String(PID_ENABLED ? "true" : "false");
+  status += ",kp:" + String(Kp, 3);
+  status += ",ki:" + String(Ki, 3);
+  status += ",kd:" + String(Kd, 3);
+  status += ",stable_count:" + String(stableCount);
+  status += ",wifi_connected:" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  status += ",client_connected:" + String(clientConnected ? "true" : "false");
+  
+  return status;
+}
+
+void sendStatusUpdate() {
+  if (clientConnected && client.connected()) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastStatusTime >= STATUS_INTERVAL) {
+      sendMessage("STATUS " + getStatusString());
+      lastStatusTime = currentTime;
+    }
+  }
+}
+
+void setTarget(long targetTicks) {
+  goalTick = targetTicks;
+  PID_ENABLED = true;
+  stableCount = 0;
+  
+  Serial.print("Target set to: ");
+  Serial.print(targetTicks);
+  Serial.println(" ticks");
+}
+
+void runPIDControl() {
+  // Get current encoder position
+  noInterrupts();
+  long currentTicks = encoderTicks;
+  interrupts();
+  
+  // Calculate error
+  long error = goalTick - currentTicks;
+  
+  // Stability check
+  const int REQUIRED_STABLE_COUNT = 50;
+  const int ERROR_THRESHOLD = 3;
+  
+  if (abs(error) <= ERROR_THRESHOLD) {
+    stableCount++;
+    if (stableCount >= REQUIRED_STABLE_COUNT) {
+      stopMotor();
+      
+      static unsigned long lastStoppedPrint = 0;
+      if (millis() - lastStoppedPrint >= 1000) {
+        String msg = "STABLE Target reached. Error: " + String(error);
+        sendMessage(msg);
+        lastStoppedPrint = millis();
+      }
+      return;
+    }
+  } else {
+    stableCount = 0;
+  }
+  
+  // PID calculation
+  pidSetpoint = goalTick;
+  pidInput = currentTicks;
+  
+  double pidControlOutput = 0;
+  if (motorPID.Compute()) {
+    pidControlOutput = pidOutput;
+  }
+  
+  // Direction logic
+  int direction = 0;
+  if (error > 0) {
+    direction = 1;
+  } else if (error < 0) {
+    direction = -1;
+  }
+  
+  // Apply speed limits
+  double speedMagnitude = abs(pidControlOutput);
+  if (speedMagnitude > 0 && speedMagnitude < 15) {
+    speedMagnitude = 15;
+  }
+  if (speedMagnitude > 255) {
+    speedMagnitude = 255;
+  }
+  
+  double finalSpeed = direction * speedMagnitude;
+  
+  // Apply to motor
+  if (finalSpeed == 0) {
+    stopMotor();
+  } else if (finalSpeed > 0) {
+    motorForward((int)abs(finalSpeed));
+  } else {
+    motorReverse((int)abs(finalSpeed));
+  }
+}
+
+void encoderISR() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long currentTime = micros();
+  
+  if (currentTime - lastInterruptTime < 200) {
+    return;
+  }
+  lastInterruptTime = currentTime;
+  
+  bool currentA = digitalRead(ENCODER_A_PIN);
+  bool currentB = digitalRead(ENCODER_B_PIN);
+  
+  if (currentA != lastEncoderA) {
+    if (currentA == currentB) {
+      encoderTicks--;
+    } else {
+      encoderTicks++;
+    }
+  }
+  
+  lastEncoderA = currentA;
+}
+
+void motorForward(int speed) {
+  speed = constrain(speed, 0, 255);
+  digitalWrite(MOTOR_DIR_PIN1, HIGH);
+  digitalWrite(MOTOR_DIR_PIN2, LOW);
+  analogWrite(MOTOR_PWM_PIN, speed);
+}
+
+void motorReverse(int speed) {
+  speed = constrain(speed, 0, 255);
+  digitalWrite(MOTOR_DIR_PIN1, LOW);
+  digitalWrite(MOTOR_DIR_PIN2, HIGH);
+  analogWrite(MOTOR_PWM_PIN, speed);
+}
+
+void stopMotor() {
+  digitalWrite(MOTOR_DIR_PIN1, HIGH);
+  digitalWrite(MOTOR_DIR_PIN2, HIGH);
+  analogWrite(MOTOR_PWM_PIN, 0);
+}
+
+void zeroEncoder() {
+  noInterrupts();
+  encoderTicks = 0;
+  interrupts();
+}
+
+void printStatus() {
+  Serial.println("\n=== System Status ===");
+  Serial.print("WiFi Status: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  }
+  Serial.print("Client Connected: ");
+  Serial.println(clientConnected ? "Yes" : "No");
+  Serial.print("PID Enabled: ");
+  Serial.println(PID_ENABLED ? "Yes" : "No");
+  Serial.print("Current PID: Kp=");
+  Serial.print(Kp, 3);
+  Serial.print(", Ki=");
+  Serial.print(Ki, 3);
+  Serial.print(", Kd=");
+  Serial.println(Kd, 3);
+  
+  noInterrupts();
+  long ticks = encoderTicks;
+  interrupts();
+  
+  Serial.print("Encoder: ");
+  Serial.print(ticks);
+  Serial.print(" ticks (");
+  Serial.print(ticks * 360.0 / 1000.0, 1);
+  Serial.println(" degrees)");
+  Serial.println("====================\n");
+}
