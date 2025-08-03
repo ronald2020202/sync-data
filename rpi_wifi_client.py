@@ -410,3 +410,345 @@ def discover_arduino():
         network_prefix = '.'.join(local_ip.split('.')[:-1]) + '.'
         
         print(f"Scanning network: {network_prefix}1-254")
+        
+        # Quick scan of common IP addresses
+        potential_ips = []
+        for i in range(1, 255):
+            ip = f"{network_prefix}{i}"
+            try:
+                # Quick connection test
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                result = sock.connect_ex((ip, 80))
+                sock.close()
+                
+                if result == 0:
+                    potential_ips.append(ip)
+                    print(f"Found device at {ip}")
+            except:
+                pass
+        
+        return potential_ips
+    
+    except Exception as e:
+        print(f"Network scan failed: {e}")
+        return []
+
+
+def rl_training_interface(controller: ArduinoPIDController):
+    """Interface for RL training - provides methods for automated PID testing"""
+    
+    class RLInterface:
+        def __init__(self, ctrl):
+            self.controller = ctrl
+            self.episode_count = 0
+        
+        def reset_episode(self) -> Dict:
+            """Reset for new episode and return initial state"""
+            self.controller.disable_pid()
+            self.controller.zero_encoder()
+            time.sleep(0.5)
+            
+            # Get initial state
+            status = self.controller.get_status()
+            self.episode_count += 1
+            
+            print(f"Episode {self.episode_count} started")
+            return status
+        
+        def step(self, pid_params: Tuple[float, float, float], target: int, duration: float = 5.0) -> Tuple[Dict, float, bool]:
+            """
+            Run one RL step: apply PID parameters and return state, reward, done
+            
+            Returns:
+                state: Current system state
+                reward: Performance reward
+                done: Whether episode is complete
+            """
+            kp, ki, kd = pid_params
+            
+            # Set PID parameters
+            self.controller.set_pid_parameters(kp, ki, kd)
+            self.controller.set_target(target)
+            self.controller.enable_pid()
+            
+            # Collect data for specified duration
+            start_time = time.time()
+            errors = []
+            stable_counts = []
+            
+            while time.time() - start_time < duration:
+                status = self.controller.get_status()
+                errors.append(abs(status.get('error', 0)))
+                stable_counts.append(status.get('stable_count', 0))
+                time.sleep(0.1)
+            
+            # Calculate reward based on performance
+            mean_error = sum(errors) / len(errors) if errors else float('inf')
+            final_error = errors[-1] if errors else float('inf')
+            max_stable = max(stable_counts) if stable_counts else 0
+            stabilized = max_stable >= 50
+            
+            # Reward function - customize based on your goals
+            reward = 0.0
+            
+            # Reward for low error
+            reward += max(0, 100 - mean_error)
+            
+            # Bonus for stabilization
+            if stabilized:
+                reward += 50
+            
+            # Bonus for fast stabilization
+            if stabilized:
+                stabilization_time = next(
+                    (i * 0.1 for i, sc in enumerate(stable_counts) if sc >= 50),
+                    duration
+                )
+                reward += max(0, 50 - stabilization_time * 10)
+            
+            # Penalty for high final error
+            reward -= final_error * 2
+            
+            # Get final state
+            final_status = self.controller.get_status()
+            
+            # Episode is done if stabilized or duration elapsed
+            done = stabilized or (time.time() - start_time >= duration)
+            
+            return final_status, reward, done
+    
+    return RLInterface(controller)
+
+
+def manual_tuning_wizard():
+    """Guided manual tuning process"""
+    print("\n=== PID Tuning Wizard ===")
+    print("This wizard will guide you through manual PID tuning")
+    
+    # Auto-discover or manual IP entry
+    print("\nStep 1: Connect to Arduino")
+    discovered_ips = discover_arduino()
+    
+    if discovered_ips:
+        print(f"Found {len(discovered_ips)} potential Arduino(s):")
+        for i, ip in enumerate(discovered_ips):
+            print(f"  {i+1}. {ip}")
+        
+        choice = input("Select Arduino (number) or enter custom IP: ").strip()
+        
+        if choice.isdigit() and 1 <= int(choice) <= len(discovered_ips):
+            arduino_ip = discovered_ips[int(choice) - 1]
+        else:
+            arduino_ip = choice
+    else:
+        arduino_ip = input("Enter Arduino IP address: ").strip()
+    
+    # Connect
+    controller = ArduinoPIDController(arduino_ip)
+    if not controller.connect():
+        return
+    
+    try:
+        print("\nStep 2: System Check")
+        
+        # Zero encoder
+        print("Zeroing encoder...")
+        controller.zero_encoder()
+        time.sleep(1)
+        
+        # Check initial status
+        status = controller.get_status()
+        print(f"Initial position: {status.get('ticks', 0)} ticks")
+        
+        print("\nStep 3: Manual Movement Test")
+        print("Testing manual motor control...")
+        
+        input("Press Enter to test forward movement...")
+        controller.motor_forward(50)
+        time.sleep(2)
+        controller.stop_motor()
+        
+        status = controller.get_status()
+        print(f"Position after forward: {status.get('ticks', 0)} ticks")
+        
+        input("Press Enter to test reverse movement...")
+        controller.motor_reverse(50)
+        time.sleep(2)
+        controller.stop_motor()
+        
+        status = controller.get_status()
+        print(f"Position after reverse: {status.get('ticks', 0)} ticks")
+        
+        controller.zero_encoder()
+        
+        print("\nStep 4: PID Tuning")
+        print("Now we'll test different PID parameters")
+        
+        # Create tuning session
+        session = PIDTuningSession(controller)
+        
+        # Suggested tuning sequence
+        suggested_tests = [
+            (1.0, 0.0, 0.0, 1000),   # P only
+            (2.0, 0.0, 0.0, 1000),   # Higher P
+            (2.0, 0.0, 0.1, 1000),   # Add some D
+            (2.0, 0.1, 0.1, 1000),   # Add some I
+        ]
+        
+        print("Suggested test sequence:")
+        for i, (kp, ki, kd, target) in enumerate(suggested_tests):
+            print(f"  {i+1}. Kp={kp}, Ki={ki}, Kd={kd}, Target={target}")
+        
+        auto_mode = input("Run suggested tests automatically? (y/n): ").lower() == 'y'
+        
+        if auto_mode:
+            print("Running automatic test sequence...")
+            for kp, ki, kd, target in suggested_tests:
+                results = session.run_test(kp, ki, kd, target, duration=8.0)
+                
+                print(f"Results: Mean Error={results['mean_error']:.1f}, "
+                      f"Stabilized={results['stabilized']}, "
+                      f"Final Error={results['final_error']:.1f}")
+                
+                time.sleep(2)  # Brief pause between tests
+        else:
+            # Manual mode
+            while True:
+                command = input("\nEnter: 'test kp ki kd target' or 'done': ").strip()
+                
+                if command.lower() == 'done':
+                    break
+                
+                if command.startswith('test '):
+                    parts = command.split()
+                    if len(parts) == 5:
+                        try:
+                            kp = float(parts[1])
+                            ki = float(parts[2])
+                            kd = float(parts[3])
+                            target = int(parts[4])
+                            
+                            results = session.run_test(kp, ki, kd, target)
+                            
+                            print(f"Results: Mean Error={results['mean_error']:.1f}, "
+                                  f"Stabilized={results['stabilized']}, "
+                                  f"Final Error={results['final_error']:.1f}")
+                        except ValueError:
+                            print("Invalid parameters")
+                    else:
+                        print("Usage: test kp ki kd target")
+        
+        # Save results
+        filename = session.save_session()
+        print(f"\nTuning session complete!")
+        print(f"Data saved to: {filename}")
+        
+        # Show best results
+        if session.session_data:
+            best_test = min(session.session_data, key=lambda x: x['mean_error'])
+            print(f"\nBest parameters found:")
+            print(f"  Kp={best_test['kp']}, Ki={best_test['ki']}, Kd={best_test['kd']}")
+            print(f"  Mean Error: {best_test['mean_error']:.2f}")
+            print(f"  Stabilized: {best_test['stabilized']}")
+    
+    except KeyboardInterrupt:
+        print("\nTuning interrupted")
+    finally:
+        controller.disconnect()
+
+
+def simple_rl_training_demo():
+    """Simplified RL training demonstration"""
+    print("\n=== Simple RL Training Demo ===")
+    
+    arduino_ip = input("Enter Arduino IP address: ").strip()
+    controller = ArduinoPIDController(arduino_ip)
+    
+    if not controller.connect():
+        return
+    
+    try:
+        rl_interface = rl_training_interface(controller)
+        
+        print("Running simplified RL training...")
+        print("This will test random PID parameters and learn which ones work best")
+        
+        # Simple random search (not true RL, but demonstrates the concept)
+        best_reward = -float('inf')
+        best_params = None
+        
+        for episode in range(10):  # Just 10 episodes for demo
+            # Generate random PID parameters
+            kp = np.random.uniform(0.5, 10.0)
+            ki = np.random.uniform(0.0, 1.0)
+            kd = np.random.uniform(0.0, 2.0)
+            
+            target = 2000  # Fixed target for consistency
+            
+            print(f"\nEpisode {episode + 1}: Testing Kp={kp:.2f}, Ki={ki:.2f}, Kd={kd:.2f}")
+            
+            # Reset for new episode
+            rl_interface.reset_episode()
+            
+            # Run test
+            state, reward, done = rl_interface.step((kp, ki, kd), target, duration=6.0)
+            
+            print(f"Reward: {reward:.2f}")
+            
+            if reward > best_reward:
+                best_reward = reward
+                best_params = (kp, ki, kd)
+                print("*** New best parameters! ***")
+            
+            time.sleep(1)
+        
+        print(f"\nTraining complete!")
+        print(f"Best parameters: Kp={best_params[0]:.3f}, Ki={best_params[1]:.3f}, Kd={best_params[2]:.3f}")
+        print(f"Best reward: {best_reward:.2f}")
+        
+        # Test the best parameters
+        print("\nTesting best parameters...")
+        rl_interface.reset_episode()
+        state, reward, done = rl_interface.step(best_params, 2000, duration=10.0)
+        print(f"Final test reward: {reward:.2f}")
+    
+    except KeyboardInterrupt:
+        print("\nTraining interrupted")
+    finally:
+        controller.disconnect()
+
+
+if __name__ == "__main__":
+    import numpy as np  # For random parameter generation
+    
+    print("=== Arduino R4 WiFi PID Controller Interface ===")
+    print("1. Interactive tuning session")
+    print("2. Simple RL training demo")
+    print("3. Direct connection test")
+    
+    choice = input("Select option (1-3): ").strip()
+    
+    if choice == "1":
+        manual_tuning_wizard()
+    elif choice == "2":
+        simple_rl_training_demo()
+    elif choice == "3":
+        arduino_ip = input("Enter Arduino IP: ").strip()
+        controller = ArduinoPIDController(arduino_ip)
+        if controller.connect():
+            print("Connection successful!")
+            print("Type commands like: 'FORWARD', 'STOP', 'STATUS', 'HELP'")
+            try:
+                while True:
+                    cmd = input("> ").strip()
+                    if cmd.lower() == 'quit':
+                        break
+                    response = controller.send_command(cmd)
+                    print(f"Response: {response}")
+            except KeyboardInterrupt:
+                pass
+            finally:
+                controller.disconnect()
+    else:
+        print("Invalid choice")
